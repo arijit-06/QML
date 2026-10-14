@@ -1,0 +1,11 @@
+{
+    "reducer": "mi",
+    "qubits": 6,
+    "reps": 1,
+    "entanglement": "full",
+    "scale": 1.0,
+    "C": 1.0,
+    "mean_cv_roc_auc": 0.8877380952380953,
+    "tuned_threshold": -0.7735793013602894,
+    "oof_f2_score": 0.8407871198568873
+}

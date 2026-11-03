@@ -1,0 +1,187 @@
+[
+  {
+    "outer_fold": 1,
+    "selected_config": {
+      "reducer": "mi",
+      "qubits": 6,
+      "reps": 2,
+      "entanglement": "linear",
+      "scale": 1.0,
+      "C": 0.1,
+      "mean_cv_roc_auc": 0.8723486513486514,
+      "std_cv_roc_auc": 0.04053552470789722
+    },
+    "threshold": -0.5938811348083053,
+    "inner_oof_f2": 0.851602023608769,
+    "classical_threshold": -0.463216802576102,
+    "classical_inner_oof_f2": 0.8773424190800682,
+    "classical_best_params": {
+      "svc__C": 1,
+      "svc__gamma": 0.01
+    },
+    "classical_reduced_threshold": -0.36841415286057194,
+    "classical_reduced_inner_oof_f2": 0.8605851979345955,
+    "classical_reduced_best_params": {
+      "C": 10.0,
+      "gamma": 0.01
+    },
+    "kernel_diagnostics": {
+      "train_kernel_symmetry_max_error": 8.881784197001252e-16,
+      "train_kernel_diagonal_max_error": 5.551115123125783e-15,
+      "train_kernel_min_eigenvalue": -3.550630755066112e-14,
+      "train_kernel_effective_rank": 12.801559029158442,
+      "train_kernel_condition_number_above_1e-12_relative_floor": 74.80458574335464,
+      "train_kernel_offdiagonal_mean": 0.14324693382775233,
+      "decision_score_center": -0.11753901799438693,
+      "decision_score_scale": 0.8205545544367138
+    }
+  },
+  {
+    "outer_fold": 2,
+    "selected_config": {
+      "reducer": "mi",
+      "qubits": 6,
+      "reps": 1,
+      "entanglement": "linear",
+      "scale": 1.0,
+      "C": 0.1,
+      "mean_cv_roc_auc": 0.8841082251082252,
+      "std_cv_roc_auc": 0.031325070371565164
+    },
+    "threshold": -0.8966058043946751,
+    "inner_oof_f2": 0.8552631578947368,
+    "classical_threshold": -0.5364886998640812,
+    "classical_inner_oof_f2": 0.8710217755443886,
+    "classical_best_params": {
+      "svc__C": 1,
+      "svc__gamma": 0.01
+    },
+    "classical_reduced_threshold": -0.8998966141694237,
+    "classical_reduced_inner_oof_f2": 0.8589951377633711,
+    "classical_reduced_best_params": {
+      "C": 100.0,
+      "gamma": 0.01
+    },
+    "kernel_diagnostics": {
+      "train_kernel_symmetry_max_error": 3.1086244689504383e-15,
+      "train_kernel_diagonal_max_error": 4.218847493575595e-15,
+      "train_kernel_min_eigenvalue": -9.40016339304691e-15,
+      "train_kernel_effective_rank": 23.720140022174498,
+      "train_kernel_condition_number_above_1e-12_relative_floor": 292302303067.5479,
+      "train_kernel_offdiagonal_mean": 0.11613069818175228,
+      "decision_score_center": -0.15097254858818226,
+      "decision_score_scale": 0.7636189212370927
+    }
+  },
+  {
+    "outer_fold": 3,
+    "selected_config": {
+      "reducer": "mi",
+      "qubits": 6,
+      "reps": 2,
+      "entanglement": "linear",
+      "scale": 1.0,
+      "C": 0.1,
+      "mean_cv_roc_auc": 0.9116993006993006,
+      "std_cv_roc_auc": 0.03202806058558004
+    },
+    "threshold": -0.05534858141949303,
+    "inner_oof_f2": 0.8781362007168458,
+    "classical_threshold": -0.5822576906528804,
+    "classical_inner_oof_f2": 0.8877721943048577,
+    "classical_best_params": {
+      "svc__C": 1,
+      "svc__gamma": 0.01
+    },
+    "classical_reduced_threshold": -0.5212194563792458,
+    "classical_reduced_inner_oof_f2": 0.8803418803418803,
+    "classical_reduced_best_params": {
+      "C": 1.0,
+      "gamma": 0.1
+    },
+    "kernel_diagnostics": {
+      "train_kernel_symmetry_max_error": 8.881784197001252e-16,
+      "train_kernel_diagonal_max_error": 5.551115123125783e-15,
+      "train_kernel_min_eigenvalue": -2.855923551418219e-14,
+      "train_kernel_effective_rank": 13.149631346131446,
+      "train_kernel_condition_number_above_1e-12_relative_floor": 67.09967154900527,
+      "train_kernel_offdiagonal_mean": 0.13733841228290342,
+      "decision_score_center": -0.12796956339406104,
+      "decision_score_scale": 0.879840642058046
+    }
+  },
+  {
+    "outer_fold": 4,
+    "selected_config": {
+      "reducer": "mi",
+      "qubits": 6,
+      "reps": 1,
+      "entanglement": "full",
+      "scale": 1.0,
+      "C": 0.1,
+      "mean_cv_roc_auc": 0.8684825174825175,
+      "std_cv_roc_auc": 0.02224583791439798
+    },
+    "threshold": -1.007014605646245,
+    "inner_oof_f2": 0.8413461538461539,
+    "classical_threshold": -0.6499255584946629,
+    "classical_inner_oof_f2": 0.8896210873146623,
+    "classical_best_params": {
+      "svc__C": 1,
+      "svc__gamma": 0.01
+    },
+    "classical_reduced_threshold": -0.7824611902834508,
+    "classical_reduced_inner_oof_f2": 0.8469055374592834,
+    "classical_reduced_best_params": {
+      "C": 1.0,
+      "gamma": 0.01
+    },
+    "kernel_diagnostics": {
+      "train_kernel_symmetry_max_error": 2.886579864025407e-15,
+      "train_kernel_diagonal_max_error": 4.218847493575595e-15,
+      "train_kernel_min_eigenvalue": -1.574560902403262e-14,
+      "train_kernel_effective_rank": 11.998287789451075,
+      "train_kernel_condition_number_above_1e-12_relative_floor": 93.42550064660405,
+      "train_kernel_offdiagonal_mean": 0.20878952258021694,
+      "decision_score_center": -0.18104581581318518,
+      "decision_score_scale": 0.8305836869077385
+    }
+  },
+  {
+    "outer_fold": 5,
+    "selected_config": {
+      "reducer": "mi",
+      "qubits": 6,
+      "reps": 2,
+      "entanglement": "linear",
+      "scale": 1.0,
+      "C": 0.1,
+      "mean_cv_roc_auc": 0.8799230769230769,
+      "std_cv_roc_auc": 0.02675642180632787
+    },
+    "threshold": -0.8806340976083474,
+    "inner_oof_f2": 0.8706467661691543,
+    "classical_threshold": -0.85661230995663,
+    "classical_inner_oof_f2": 0.860128617363344,
+    "classical_best_params": {
+      "svc__C": 1,
+      "svc__gamma": 0.01
+    },
+    "classical_reduced_threshold": -0.7039181484784092,
+    "classical_reduced_inner_oof_f2": 0.8685064935064936,
+    "classical_reduced_best_params": {
+      "C": 1.0,
+      "gamma": "auto"
+    },
+    "kernel_diagnostics": {
+      "train_kernel_symmetry_max_error": 1.9984014443252818e-15,
+      "train_kernel_diagonal_max_error": 5.773159728050814e-15,
+      "train_kernel_min_eigenvalue": -1.2243945287139977e-14,
+      "train_kernel_effective_rank": 25.93406517807205,
+      "train_kernel_condition_number_above_1e-12_relative_floor": 341619792928.6375,
+      "train_kernel_offdiagonal_mean": 0.10734152705476709,
+      "decision_score_center": -0.09840397254339746,
+      "decision_score_scale": 0.7777040467644911
+    }
+  }
+]

@@ -1,765 +1,566 @@
-"""
-Quantum Support Vector Machine (QSVM) on UCI Heart Disease (Cleveland, ID=45)
-=============================================================================
-An academic-grade, leak-free, cross-validated and grid-tuned implementation
-comparing a Fidelity Quantum Kernel against tuned classical RBF-SVM baselines.
-
-Addresses research gaps from:
-  - Munir et al., AI (MDPI) 2026, 7(5), 180 (no feature map tuning, no threshold tuning)
-  - Kumar et al., Sci Rep 2025; Rawat et al., NMAHIB 2025; Ghisoni et al., Sci Rep 2026
-
-Features:
-  1. No subsampling: evaluates full 297 cleaned patient records.
-  2. Strict train/test isolation: 75/25 stratified split (seed 42).
-  3. Preprocessing fit strictly inside folds (StandardScaler -> Reducer -> MinMaxScaler).
-  4. Reducers: SelectKBest(mutual_info_classif) vs PCA.
-  5. Fast exact statevector quantum kernel: K = |A @ B.conj().T|**2 using zz_feature_map.
-  6. Comprehensive grid search over (reducer, qubits, reps, entanglement, scale, C).
-  7. Out-Of-Fold (OOF) decision threshold tuning maximizing clinical F2 score (recall-weighted).
-  8. Two GridSearchCV-tuned classical RBF-SVM baselines (all 13 features vs same reduced input).
-  9. Multi-seed robustness evaluation across 5 independent seeds (mean +/- std).
-  10. Automated generation of all academic figures, tables, and summary CSVs in outputs/.
-"""
+"""Nested-CV quantum-kernel and classical baselines for Cleveland heart data."""
 from __future__ import annotations
 
-import os
-import sys
-import json
-import time
 import argparse
+from functools import partial
+from itertools import combinations, product
+import hashlib
+import json
+import os
+import platform
+import sys
+import time
 import warnings
 from pathlib import Path
 
-# Safe terminal encoding on Windows consoles
-if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
-
-# Non-interactive matplotlib backend for headless figure generation
+os.environ.setdefault("MPLBACKEND", "Agg")
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
 import numpy as np
 import pandas as pd
-# pyrefly: ignore [missing-import]
-from ucimlrepo import fetch_ucirepo
-
-from sklearn.model_selection import StratifiedKFold, GridSearchCV, train_test_split
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
-from sklearn.feature_selection import SelectKBest, mutual_info_classif
-from sklearn.decomposition import PCA
-from sklearn.pipeline import Pipeline
-from sklearn.svm import SVC
-from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, f1_score,
-    roc_auc_score, confusion_matrix, roc_curve, fbeta_score
-)
+import qiskit
+import sklearn
 from joblib import Parallel, delayed
-
 from qiskit.circuit.library import zz_feature_map
 from qiskit.quantum_info import Statevector
+from sklearn.base import clone
+from sklearn.compose import ColumnTransformer
+from sklearn.decomposition import PCA
+from sklearn.feature_selection import SelectKBest, mutual_info_classif
+from sklearn.metrics import (accuracy_score, confusion_matrix, f1_score,
+                             fbeta_score, precision_score, recall_score,
+                             roc_auc_score, roc_curve)
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import MinMaxScaler, OneHotEncoder, StandardScaler
+from sklearn.svm import SVC
 
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=UserWarning)
+ROOT = Path(__file__).resolve().parent
+OUT = ROOT / "outputs"
+DEFAULT_DATA = ROOT / "heart_disease_cleveland.csv"
+CATEGORICAL = {"sex", "cp", "fbs", "restecg", "exang", "slope", "ca", "thal"}
+SEED = 42
 
-# ===========================================================================
-# 1. Statevector & Quantum Kernel Utilities
-# ===========================================================================
-def compute_statevectors(X: np.ndarray, n_qubits: int, reps: int, entanglement: str) -> np.ndarray:
-    """
-    Compute exact noiseless statevectors for input array X.
-    Deterministic parameter assignment guarantees feature-to-qubit alignment.
-    """
-    qc = zz_feature_map(feature_dimension=n_qubits, reps=reps, entanglement=entanglement)
-    sorted_params = sorted(qc.parameters, key=lambda p: int(p.name.split('[')[1].rstrip(']')))
-    
-    states = []
+
+def load_data(dataset_path: str | None = None, target_column: str | None = None):
+    """Load and validate numeric tabular data. Cleveland labels 0..4 map to 0/1."""
+    path = Path(dataset_path).expanduser().resolve() if dataset_path else DEFAULT_DATA
+    if not path.is_file():
+        raise FileNotFoundError(f"Dataset not found: {path}")
+    raw_frame = pd.read_csv(path)
+    frame = raw_frame.copy()
+    if frame.empty or frame.shape[1] < 2:
+        raise ValueError("Dataset must contain feature columns and one target column.")
+    target = target_column or str(frame.columns[-1])
+    if target not in frame.columns:
+        raise ValueError(f"Target column {target!r} is not present in {path.name}.")
+    y_raw = pd.to_numeric(frame.pop(target), errors="coerce")
+    X_df = frame.apply(pd.to_numeric, errors="coerce")
+    X_df = X_df.replace([np.inf, -np.inf], np.nan)
+    valid = y_raw.notna() & np.isfinite(y_raw) & X_df.notna().all(axis=1)
+    X_df, y_raw = X_df.loc[valid], y_raw.loc[valid]
+    labels = np.sort(y_raw.unique())
+    if len(labels) != 2 and not np.all(np.isclose(labels, np.round(labels)) & (labels >= 0) & (labels <= 4)):
+        raise ValueError(f"Target must be binary or use Cleveland 0..4 labels; found {labels.tolist()}.")
+    y = (y_raw.to_numpy() > 0).astype(int)
+    if np.unique(y).size != 2:
+        raise ValueError("Target must contain both negative and positive examples after binarization.")
+    if len(X_df) < 50:
+        raise ValueError(f"Only {len(X_df)} complete rows remain; at least 50 are required.")
+    if X_df.columns.duplicated().any():
+        raise ValueError("Feature names must be unique.")
+    return X_df.reset_index(drop=True), y, path, int(len(raw_frame) - len(X_df))
+
+
+def make_encoder(X: pd.DataFrame) -> ColumnTransformer:
+    cats = [c for c in X.columns if c.lower() in CATEGORICAL]
+    nums = [c for c in X.columns if c not in cats]
+    transformers = []
+    if nums:
+        transformers.append(("numeric", StandardScaler(), nums))
+    if cats:
+        transformers.append(("categorical", OneHotEncoder(handle_unknown="ignore", sparse_output=False), cats))
+    return ColumnTransformer(transformers, remainder="drop", verbose_feature_names_out=False)
+
+
+def encoded_discrete_mask(encoder: ColumnTransformer) -> np.ndarray:
+    """Mark one-hot outputs as discrete for mutual-information scoring."""
+    names = encoder.get_feature_names_out()
+    return np.array(["=" in name or name.split("_")[0].lower() in CATEGORICAL for name in names], dtype=bool)
+
+
+def fit_representation(X_train: pd.DataFrame, y_train: np.ndarray, X_eval: pd.DataFrame,
+                       reducer_name: str, k: int, scale: float, seed: int):
+    encoder = make_encoder(X_train).fit(X_train)
+    A, B = encoder.transform(X_train), encoder.transform(X_eval)
+    if k > A.shape[1]:
+        raise ValueError(f"Cannot select {k} dimensions from {A.shape[1]} encoded columns.")
+    if reducer_name == "mi":
+        mask = encoded_discrete_mask(encoder)
+        scorer = partial(mutual_info_classif, discrete_features=mask, random_state=seed)
+        reducer = SelectKBest(score_func=scorer, k=k)
+    else:
+        reducer = PCA(n_components=k, random_state=seed)
+    A = reducer.fit_transform(A, y_train) if reducer_name == "mi" else reducer.fit_transform(A)
+    B = reducer.transform(B)
+    scaler = MinMaxScaler(feature_range=(0.0, float(scale))).fit(A)
+    return scaler.transform(A), scaler.transform(B), encoder, reducer, scaler
+
+
+def statevectors(X: np.ndarray, n_qubits: int, reps: int, entanglement: str) -> np.ndarray:
+    if X.ndim != 2 or X.shape[1] != n_qubits:
+        raise ValueError(f"Expected transformed shape (n, {n_qubits}); received {X.shape}.")
+    circuit = zz_feature_map(feature_dimension=n_qubits, reps=reps, entanglement=entanglement)
+    params = sorted(circuit.parameters, key=lambda p: int(p.name.split("[")[1].rstrip("]")))
+    rows = []
     for row in X:
-        param_dict = dict(zip(sorted_params, row))
-        bound_qc = qc.assign_parameters(param_dict)
-        sv = Statevector(bound_qc)
-        states.append(sv.data)
-    return np.array(states)
+        bound = circuit.assign_parameters(dict(zip(params, row)), strict=True)
+        rows.append(Statevector(bound).data)
+    return np.asarray(rows)
 
 
-def compute_kernel_matrix(states_a: np.ndarray, states_b: np.ndarray | None = None) -> np.ndarray:
-    """
-    Compute Fidelity Quantum Kernel matrix from statevectors:
-      K_ij = |<psi(x_i)|psi(x_j)>|^2 = |A @ B.conj().T|**2
-    Mathematically identical to FidelityQuantumKernel on noiseless statevector,
-    but orders of magnitude faster.
-    """
-    if states_b is None:
-        return np.abs(states_a @ states_a.conj().T) ** 2
-    return np.abs(states_a @ states_b.conj().T) ** 2
+def kernel(A: np.ndarray, B: np.ndarray | None = None) -> np.ndarray:
+    B = A if B is None else B
+    return np.abs(A @ B.conj().T) ** 2
 
 
-# ===========================================================================
-# 2. Preprocessing Pipeline Builder
-# ===========================================================================
-def build_preprocessed_fold(X_tr: np.ndarray, y_tr: np.ndarray, X_val: np.ndarray,
-                           reducer_type: str, n_qubits: int, scale: float):
-    """
-    Fit StandardScaler, Reducer, and MinMaxScaler strictly on training fold data.
-    Transform validation/test fold without any data leakage.
-    """
-    scaler = StandardScaler().fit(X_tr)
-    X_tr_s = scaler.transform(X_tr)
-    X_val_s = scaler.transform(X_val)
-
-    if reducer_type == "mi":
-        reducer = SelectKBest(score_func=mutual_info_classif, k=n_qubits)
-        reducer.fit(X_tr_s, y_tr)
-    elif reducer_type == "pca":
-        reducer = PCA(n_components=n_qubits, random_state=42)
-        reducer.fit(X_tr_s)
-    else:
-        raise ValueError(f"Unknown reducer: {reducer_type}")
-
-    X_tr_r = reducer.transform(X_tr_s)
-    X_val_r = reducer.transform(X_val_s)
-
-    minmax = MinMaxScaler(feature_range=(0, scale)).fit(X_tr_r)
-    X_tr_q = minmax.transform(X_tr_r)
-    X_val_q = minmax.transform(X_val_r)
-
-    return X_tr_q, X_val_q, scaler, reducer, minmax
+def projected_observables(states: np.ndarray, n_qubits: int, order: int = 1) -> np.ndarray:
+    """Return all Pauli expectations on subsets of up to ``order`` qubits."""
+    indices = np.arange(1 << n_qubits)
+    features = []
+    for weight in range(1, order + 1):
+        for qubits in combinations(range(n_qubits), weight):
+            for paulis in product("XYZ", repeat=weight):
+                flip_mask = 0
+                phase = np.ones(len(indices), dtype=complex)
+                for qubit, pauli in zip(qubits, paulis):
+                    bit = 1 << qubit
+                    bits_set = (indices & bit) != 0
+                    if pauli in "XY":
+                        flip_mask |= bit
+                    if pauli == "Y":
+                        phase *= 1j * np.where(bits_set, -1.0, 1.0)
+                    elif pauli == "Z":
+                        phase *= np.where(bits_set, -1.0, 1.0)
+                mapped = indices ^ flip_mask
+                exp_value = np.sum(states[:, mapped].conj() * states * phase[None, :], axis=1)
+                features.append(exp_value.real)
+    return np.column_stack(features)
 
 
-# ===========================================================================
-# 3. Grid Evaluation for a Single Circuit Config (Across All C Values)
-# ===========================================================================
-def evaluate_circuit_config_on_cv(circuit_cfg: dict, X_train: np.ndarray, y_train: np.ndarray,
-                                  c_values: list[float], n_folds: int = 5) -> list[dict]:
-    """
-    For a given (reducer, qubits, reps, entanglement, scale) circuit configuration:
-    Compute 5-fold CV states once, then instantly evaluate all C values.
-    Returns list of result dictionaries (one per C value).
-    """
-    reducer_type = circuit_cfg["reducer"]
-    n_qubits = circuit_cfg["qubits"]
-    reps = circuit_cfg["reps"]
-    entanglement = circuit_cfg["entanglement"]
-    scale = circuit_cfg["scale"]
-
-    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
-    
-    # Precompute fold kernels once
-    fold_kernels = []
-    for tr_idx, val_idx in skf.split(X_train, y_train):
-        X_tr, y_tr = X_train[tr_idx], y_train[tr_idx]
-        X_val, y_val = X_train[val_idx], y_train[val_idx]
-
-        X_tr_q, X_val_q, _, _, _ = build_preprocessed_fold(
-            X_tr, y_tr, X_val, reducer_type, n_qubits, scale
-        )
-        states_tr = compute_statevectors(X_tr_q, n_qubits, reps, entanglement)
-        states_val = compute_statevectors(X_val_q, n_qubits, reps, entanglement)
-
-        K_tr = compute_kernel_matrix(states_tr)
-        K_val = compute_kernel_matrix(states_val, states_tr)
-        fold_kernels.append((K_tr, y_tr, K_val, y_val, val_idx))
-
-    # Evaluate each C value against precomputed kernels
-    results = []
-    for C in c_values:
-        fold_aucs = []
-        oof_scores = np.zeros(len(X_train))
-
-        for K_tr, y_tr, K_val, y_val, val_idx in fold_kernels:
-            clf = SVC(kernel="precomputed", C=C)
-            clf.fit(K_tr, y_tr)
-            val_scores = clf.decision_function(K_val)
-            oof_scores[val_idx] = val_scores
-            fold_aucs.append(roc_auc_score(y_val, val_scores))
-
-        mean_auc = float(np.mean(fold_aucs))
-        std_auc = float(np.std(fold_aucs))
-        oof_auc = float(roc_auc_score(y_train, oof_scores))
-
-        entry = {
-            "reducer": reducer_type,
-            "qubits": n_qubits,
-            "reps": reps,
-            "entanglement": entanglement,
-            "scale": scale,
-            "C": C,
-            "mean_cv_roc_auc": mean_auc,
-            "std_cv_roc_auc": std_auc,
-            "oof_roc_auc": oof_auc,
-        }
-        results.append(entry)
-
-    return results
+def local_bloch_features(states: np.ndarray, n_qubits: int) -> np.ndarray:
+    return projected_observables(states, n_qubits, order=1)
 
 
-# ===========================================================================
-# 4. Out-Of-Fold F2 Decision Threshold Optimization
-# ===========================================================================
-def optimize_threshold_f2(best_cfg: dict, X_train: np.ndarray, y_train: np.ndarray, n_folds: int = 5):
-    """
-    Perform 5-fold CV using best hyperparameters to gather out-of-fold continuous
-    decision scores, then find threshold tau maximizing clinical F2 score (recall-weighted).
-    Returns (best_threshold, best_f2, oof_scores).
-    """
-    reducer_type = best_cfg["reducer"]
-    n_qubits = best_cfg["qubits"]
-    reps = best_cfg["reps"]
-    entanglement = best_cfg["entanglement"]
-    scale = best_cfg["scale"]
-    C = best_cfg["C"]
-
-    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
-    oof_scores = np.zeros(len(X_train))
-
-    for tr_idx, val_idx in skf.split(X_train, y_train):
-        X_tr, y_tr = X_train[tr_idx], y_train[tr_idx]
-        X_val, y_val = X_train[val_idx], y_train[val_idx]
-
-        X_tr_q, X_val_q, _, _, _ = build_preprocessed_fold(
-            X_tr, y_tr, X_val, reducer_type, n_qubits, scale
-        )
-        states_tr = compute_statevectors(X_tr_q, n_qubits, reps, entanglement)
-        states_val = compute_statevectors(X_val_q, n_qubits, reps, entanglement)
-
-        K_tr = compute_kernel_matrix(states_tr)
-        K_val = compute_kernel_matrix(states_val, states_tr)
-
-        clf = SVC(kernel="precomputed", C=C)
-        clf.fit(K_tr, y_tr)
-        oof_scores[val_idx] = clf.decision_function(K_val)
-
-    # Search thresholds across distribution percentiles (including 0.0)
-    percentiles = np.linspace(np.percentile(oof_scores, 2), np.percentile(oof_scores, 98), 200)
-    candidate_thresholds = np.unique(np.concatenate([percentiles, [0.0]]))
-
-    best_tau = 0.0
-    best_f2 = -1.0
-    for tau in candidate_thresholds:
-        preds = (oof_scores >= tau).astype(int)
-        f2 = fbeta_score(y_train, preds, beta=2, zero_division=0)
-        if f2 > best_f2:
-            best_f2 = f2
-            best_tau = float(tau)
-
-    return best_tau, best_f2, oof_scores
+def squared_distances(A: np.ndarray, B: np.ndarray) -> np.ndarray:
+    return np.maximum(0.0, (A * A).sum(axis=1)[:, None] +
+                      (B * B).sum(axis=1)[None, :] - 2.0 * A @ B.T)
 
 
-# ===========================================================================
-# 5. Metric Calculation Helper
-# ===========================================================================
-def compute_all_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_score: np.ndarray) -> dict:
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
-    acc = accuracy_score(y_true, y_pred)
-    prec = precision_score(y_true, y_pred, zero_division=0)
-    rec = recall_score(y_true, y_pred, zero_division=0)
-    spec = float(tn / (tn + fp)) if (tn + fp) > 0 else 0.0
-    f1 = f1_score(y_true, y_pred, zero_division=0)
-    try:
-        auc = roc_auc_score(y_true, y_score)
-    except Exception:
-        auc = float("nan")
-
-    return {
-        "Accuracy": float(acc),
-        "Precision": float(prec),
-        "Recall": float(rec),
-        "Specificity": float(spec),
-        "F1": float(f1),
-        "ROC-AUC": float(auc),
-        "TN": int(tn),
-        "FP": int(fp),
-        "FN": int(fn),
-        "TP": int(tp),
-    }
+def quantum_kernel_pair(states_a: np.ndarray, states_b: np.ndarray, cfg: dict,
+                        n_qubits: int):
+    """Construct either the fidelity or local projected quantum kernel."""
+    if cfg["kernel_type"] == "fidelity":
+        return kernel(states_a), kernel(states_b, states_a), None
+    order = int(cfg.get("projection_order") or 1)
+    features_a = projected_observables(states_a, n_qubits, order)
+    features_b = projected_observables(states_b, n_qubits, order)
+    d_train = squared_distances(features_a, features_a)
+    upper = d_train[np.triu_indices_from(d_train, k=1)]
+    median = float(np.median(upper)) if upper.size else 1.0
+    gamma = float(cfg["gamma_multiplier"] / max(median, 1e-12))
+    K_train = np.exp(-gamma * d_train)
+    K_eval = np.exp(-gamma * squared_distances(features_b, features_a))
+    return K_train, K_eval, gamma
 
 
-# ===========================================================================
-# 6. Main Execution Pipeline
-# ===========================================================================
-def run_pipeline(quick: bool = False, dataset_path: str | None = None):
-    t_start = time.time()
-    outputs_dir = Path("outputs")
-    outputs_dir.mkdir(exist_ok=True)
+def cached_quantum_kernel(states_a: np.ndarray, states_b: np.ndarray,
+                          distances: tuple[np.ndarray, np.ndarray, float], cfg: dict):
+    if cfg["kernel_type"] == "fidelity":
+        return kernel(states_a), kernel(states_b, states_a)
+    d_train, d_eval, median = distances
+    gamma = float(cfg["gamma_multiplier"] / max(median, 1e-12))
+    return np.exp(-gamma * d_train), np.exp(-gamma * d_eval)
 
-    print("=" * 78)
-    print("  QUANTUM SUPPORT VECTOR MACHINE (QSVM) - HEART DISEASE PREDICTION")
-    print("  UCI Cleveland Dataset (id=45) | Academic Benchmark & Tuning Pipeline")
-    print("=" * 78)
-    print(f"Python      : {sys.version.split()[0]}")
-    import qiskit, sklearn
-    print(f"Qiskit      : {qiskit.__version__}")
-    print(f"Scikit-Learn: {sklearn.__version__}\n")
 
-    # -----------------------------------------------------------------------
-    # Step A: Data Loading & Preprocessing
-    # -----------------------------------------------------------------------
-    local_csv_path = Path("heart_disease_cleveland.csv")
+def normalized_margin(model: SVC, K_train: np.ndarray, K_eval: np.ndarray):
+    train_scores = model.decision_function(K_train)
+    center = float(np.mean(train_scores))
+    spread = float(np.std(train_scores)) or 1.0
+    return (model.decision_function(K_eval) - center) / spread, center, spread
 
-    if dataset_path and Path(dataset_path).exists():
-        print(f"Loading custom dataset from: {dataset_path}")
-        df_raw = pd.read_csv(dataset_path)
-        target_col = df_raw.columns[-1]
-        df = df_raw.dropna().copy()
-        df[target_col] = (df[target_col] > 0).astype(int)
-        feature_names = [c for c in df.columns if c != target_col]
-        X = df[feature_names].values
-        y = df[target_col].values
-    elif local_csv_path.exists():
-        print(f"Loading cached Cleveland dataset from local file: {local_csv_path} ...")
-        df_raw = pd.read_csv(local_csv_path)
-        target_col = df_raw.columns[-1]
-        df = df_raw.dropna().copy()
-        df[target_col] = (df[target_col] > 0).astype(int)
-        feature_names = [c for c in df.columns if c != target_col]
-        X = df[feature_names].values
-        y = df[target_col].values
-    else:
-        print("Fetching UCI Heart Disease dataset (id=45) via ucimlrepo ...")
-        try:
-            heart = fetch_ucirepo(id=45)
-            X_df = heart.data.features.copy()
-            y_df = heart.data.targets.copy()
-            target_col = y_df.columns[0]
-            df_merged = pd.concat([X_df, y_df], axis=1).dropna()
-            df_merged.to_csv(local_csv_path, index=False)
-            df_merged[target_col] = (df_merged[target_col] > 0).astype(int)
-            feature_names = [c for c in df_merged.columns if c != target_col]
-            X = df_merged[feature_names].values
-            y = df_merged[target_col].values
-        except Exception as e:
-            print(f"[!] Warning: ucimlrepo network request failed ({e}).")
-            print("    Attempting direct download fallback ...")
-            try:
-                import urllib.request
-                url = "https://archive.ics.uci.edu/static/public/45/data.csv"
-                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=15) as resp:
-                    df_raw = pd.read_csv(resp)
-                    df_raw.to_csv(local_csv_path, index=False)
-                target_col = df_raw.columns[-1]
-                df = df_raw.dropna().copy()
-                df[target_col] = (df[target_col] > 0).astype(int)
-                feature_names = [c for c in df.columns if c != target_col]
-                X = df[feature_names].values
-                y = df[target_col].values
-            except Exception as e2:
-                raise RuntimeError(
-                    f"Unable to fetch UCI dataset due to network connection reset ({e2}). "
-                    f"Please verify internet connection or place 'heart_disease_cleveland.csv' in current directory."
-                )
 
-    n_samples, n_features = X.shape
-    class_counts = dict(zip(*np.unique(y, return_counts=True)))
-    print(f"Samples (Cleaned) : {n_samples} (Dropped rows with missing ca/thal)")
-    print(f"Features          : {n_features}")
-    print(f"Class Balance     : {class_counts} [0: No Disease, 1: Disease]\n")
-
-    # Stratified 75/25 Train/Test Split (Fixed seed 42)
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.25, stratify=y, random_state=42
-    )
-    print(f"Train samples     : {len(X_train)} (Class 0: {sum(y_train==0)}, Class 1: {sum(y_train==1)})")
-    print(f"Test samples      : {len(X_test)}  (Class 0: {sum(y_test==0)}, Class 1: {sum(y_test==1)})\n")
-
-    # -----------------------------------------------------------------------
-    # Step B: Hyperparameter Tuning Grid (5-Fold Stratified CV on X_train)
-    # -----------------------------------------------------------------------
-    if quick:
-        print("[QUICK MODE ACTIVATED: Evaluating minimal parameter grid]")
-        reducers = ["mi"]
-        qubits_list = [4]
-        reps_list = [1]
-        entanglements = ["linear"]
-        scales = [np.pi]
-        c_values = [1.0, 10.0]
-    else:
-        print("[FULL GRID MODE: 32 Circuit Configurations x 4 C Values = 128 Combinations]")
-        reducers = ["mi", "pca"]
-        qubits_list = [4, 6]
-        reps_list = [1, 2]
-        entanglements = ["linear", "full"]
-        scales = [1.0, np.pi]
-        c_values = [0.1, 1.0, 10.0, 100.0]
-
-    circuit_configs = []
-    for red in reducers:
-        for q in qubits_list:
-            for r in reps_list:
-                for ent in entanglements:
+def circuit_groups(quick: bool):
+    reducers, qubits, reps = (["mi"], [4], [1]) if quick else (["mi", "pca"], [4, 6, 8], [1, 2])
+    entanglements = ["linear"] if quick else ["linear", "full"]
+    scales = [float(np.pi)] if quick else [1.0, float(np.pi)]
+    c_values = [1.0, 10.0] if quick else [0.1, 1.0, 10.0, 100.0]
+    configs = []
+    for r in reducers:
+        for k in qubits:
+            for d in reps:
+                for e in entanglements:
                     for s in scales:
-                        circuit_configs.append({
-                            "reducer": red,
-                            "qubits": q,
-                            "reps": r,
-                            "entanglement": ent,
-                            "scale": s,
-                        })
+                        core = {"reducer": r, "qubits": k, "reps": d,
+                                "entanglement": e, "scale": s}
+                        configs.append({**core, "kernel_type": "fidelity",
+                                        "projection_order": None, "gamma_multiplier": None})
+                        orders = [1] if quick else [1, 2]
+                        gammas = [1.0] if quick else [0.1, 1.0, 10.0]
+                        for order in orders:
+                            for gamma in gammas:
+                                configs.append({**core, "kernel_type": "projected",
+                                                "projection_order": order,
+                                                "gamma_multiplier": gamma})
+    return configs, c_values
 
-    print(f"Dispatching {len(circuit_configs)} circuit configurations across CPU cores using joblib ...")
-    t_grid_start = time.time()
-    parallel_results = Parallel(n_jobs=-1, verbose=1)(
-        delayed(evaluate_circuit_config_on_cv)(cfg, X_train, y_train, c_values, n_folds=5)
-        for cfg in circuit_configs
-    )
-    t_grid_end = time.time()
-    print(f"Grid search completed in {t_grid_end - t_grid_start:.2f} seconds.\n")
 
-    # Flatten all results into a DataFrame
-    all_grid_rows = [row for batch in parallel_results for row in batch]
-    df_tuning = pd.DataFrame(all_grid_rows)
-    df_tuning.sort_values(by="mean_cv_roc_auc", ascending=False, inplace=True)
-    df_tuning.reset_index(drop=True, inplace=True)
+def evaluate_group(group: dict, X: pd.DataFrame, y: np.ndarray, c_values: list[float],
+                   folds: int, seed: int):
+    """Reuse fold encodings across circuit depths/topologies and all C values."""
+    skf = StratifiedKFold(n_splits=folds, shuffle=True, random_state=seed)
+    fold_data = []
+    for fold, (it, iv) in enumerate(skf.split(X, y)):
+        A, B, *_ = fit_representation(X.iloc[it], y[it], X.iloc[iv], group["reducer"],
+                                      group["qubits"], group["scale"], seed + fold)
+        maps = {}
+        for reps in sorted({cfg["reps"] for cfg in group["configs"]}):
+            for ent in sorted({cfg["entanglement"] for cfg in group["configs"]}):
+                sa = statevectors(A, group["qubits"], reps, ent)
+                sb = statevectors(B, group["qubits"], reps, ent)
+                maps[(reps, ent, "fidelity", None, None)] = (kernel(sa), kernel(sb, sa))
+                projected_specs = {(cfg["projection_order"], cfg["gamma_multiplier"])
+                                   for cfg in group["configs"]
+                                    if cfg["reps"] == reps and cfg["entanglement"] == ent
+                                    and cfg["kernel_type"] == "projected"}
+                for order in sorted({o for o, _ in projected_specs}):
+                    obs_a = projected_observables(sa, group["qubits"], order)
+                    obs_b = projected_observables(sb, group["qubits"], order)
+                    d_train = squared_distances(obs_a, obs_a)
+                    d_eval = squared_distances(obs_b, obs_a)
+                    upper = d_train[np.triu_indices_from(d_train, k=1)]
+                    median = float(np.median(upper)) if upper.size else 1.0
+                    for multiplier in sorted(g for o, g in projected_specs if o == order):
+                        gamma = float(multiplier / max(median, 1e-12))
+                        maps[(reps, ent, "projected", order, multiplier)] = (
+                            np.exp(-gamma * d_train), np.exp(-gamma * d_eval))
+        fold_data.append((it, iv, y[it], y[iv], maps))
 
-    # Save full tuning results
-    df_tuning.to_csv(outputs_dir / "qsvm_tuning_results.csv", index=False)
-    df_tuning.to_csv("qsvm_tuning_results.csv", index=False)  # also at root as requested
+    records = []
+    for cfg in group["configs"]:
+        for C in c_values:
+            scores = np.zeros(len(y))
+            fold_auc = []
+            for it, iv, yt, yv, maps in fold_data:
+                Ktr, Kev = maps[(cfg["reps"], cfg["entanglement"], cfg["kernel_type"],
+                                  cfg["projection_order"], cfg["gamma_multiplier"])]
+                clf = SVC(kernel="precomputed", C=C).fit(Ktr, yt)
+                scores[iv], _, _ = normalized_margin(clf, Ktr, Kev)
+                fold_auc.append(float(roc_auc_score(yv, scores[iv])))
+            records.append({**cfg, "C": float(C), "mean_cv_roc_auc": float(np.mean(fold_auc)),
+                            "std_cv_roc_auc": float(np.std(fold_auc)), "oof_scores": scores})
+    return records
 
-    top5_df = df_tuning.head(5)
-    top5_df.to_csv(outputs_dir / "top5_tuning_configs.csv", index=False)
-    print("=" * 78)
-    print("  TOP 5 TUNING CONFIGURATIONS (Sorted by 5-Fold CV ROC-AUC)")
-    print("=" * 78)
-    print(top5_df.to_string(index=False))
-    print()
 
-    best_cfg = df_tuning.iloc[0].to_dict()
-    print(f"[*] BEST QSVM CONFIGURATION:")
-    for k, v in best_cfg.items():
-        print(f"    {k:<16s}: {v}")
-    print()
+def choose_threshold(scores: np.ndarray, y: np.ndarray):
+    thresholds = np.r_[np.unique(scores), np.nextafter(np.max(scores), np.inf)]
+    f2s = [fbeta_score(y, scores >= t, beta=2, zero_division=0) for t in thresholds]
+    # Prefer the higher threshold on ties, which reduces false positives.
+    best = max(range(len(f2s)), key=lambda i: (f2s[i], thresholds[i]))
+    return float(thresholds[best]), float(f2s[best])
 
-    # -----------------------------------------------------------------------
-    # Step C: Out-Of-Fold (OOF) Decision Threshold Optimization (Recall-Weighted F2)
-    # -----------------------------------------------------------------------
-    print("=" * 78)
-    print("  OUT-OF-FOLD (OOF) DECISION THRESHOLD TUNING (F2 SCORE)")
-    print("=" * 78)
-    tuned_threshold, oof_f2, oof_scores = optimize_threshold_f2(best_cfg, X_train, y_train, n_folds=5)
-    default_f2 = fbeta_score(y_train, (oof_scores >= 0.0).astype(int), beta=2, zero_division=0)
-    print(f"OOF Decision Score Range : [{oof_scores.min():.4f}, {oof_scores.max():.4f}]")
-    print(f"Default Threshold (0.00) : OOF F2 = {default_f2:.4f}")
-    print(f"Tuned Threshold   ({tuned_threshold:+.4f}) : OOF F2 = {oof_f2:.4f}\n")
 
-    # Save best config JSON
-    best_config_export = {
-        "reducer": str(best_cfg["reducer"]),
-        "qubits": int(best_cfg["qubits"]),
-        "reps": int(best_cfg["reps"]),
-        "entanglement": str(best_cfg["entanglement"]),
-        "scale": float(best_cfg["scale"]),
-        "C": float(best_cfg["C"]),
-        "mean_cv_roc_auc": float(best_cfg["mean_cv_roc_auc"]),
-        "tuned_threshold": float(tuned_threshold),
-        "oof_f2_score": float(oof_f2),
+def metric_row(y: np.ndarray, scores: np.ndarray, threshold: float):
+    pred = (scores >= threshold).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y, pred, labels=[0, 1]).ravel()
+    return {"Accuracy": float(accuracy_score(y, pred)),
+            "Precision": float(precision_score(y, pred, zero_division=0)),
+            "Recall": float(recall_score(y, pred, zero_division=0)),
+            "Specificity": float(tn / (tn + fp)) if tn + fp else 0.0,
+            "F1": float(f1_score(y, pred, zero_division=0)),
+            "ROC-AUC": float(roc_auc_score(y, scores)),
+            "TN": int(tn), "FP": int(fp), "FN": int(fn), "TP": int(tp)}
+
+
+def fit_quantum(Xtr, ytr, Xev, cfg, seed):
+    A, B, encoder, reducer, scaler = fit_representation(
+        Xtr, ytr, Xev, cfg["reducer"], cfg["qubits"], cfg["scale"], seed)
+    sv_tr = statevectors(A, cfg["qubits"], cfg["reps"], cfg["entanglement"])
+    sv_ev = statevectors(B, cfg["qubits"], cfg["reps"], cfg["entanglement"])
+    Ktr, Kev, actual_gamma = quantum_kernel_pair(sv_tr, sv_ev, cfg, cfg["qubits"])
+    clf = SVC(kernel="precomputed", C=cfg["C"]).fit(Ktr, ytr)
+    scores, center, spread = normalized_margin(clf, Ktr, Kev)
+    # Kernel diagnostics are on the final training Gram matrix.
+    sym_err = float(np.max(np.abs(Ktr - Ktr.T)))
+    eigenvalues = np.linalg.eigvalsh((Ktr + Ktr.T) / 2)
+    eig_min = float(eigenvalues.min())
+    positive = np.clip(eigenvalues, 0.0, None)
+    probs = positive / positive.sum() if positive.sum() else positive
+    effective_rank = float(np.exp(-np.sum(probs[probs > 0] * np.log(probs[probs > 0]))))
+    spectral_floor = max(float(eigenvalues.max()), 1.0) * 1e-12
+    resolved_positive = eigenvalues[eigenvalues > spectral_floor]
+    resolved_condition = (float(resolved_positive.max() / resolved_positive.min())
+                          if resolved_positive.size else float("nan"))
+    return scores, (encoder, reducer, scaler, clf, sv_tr), {
+        "train_kernel_symmetry_max_error": sym_err,
+        "train_kernel_diagonal_max_error": float(np.max(np.abs(np.diag(Ktr) - 1.0))),
+        "train_kernel_min_eigenvalue": eig_min,
+        "train_kernel_effective_rank": effective_rank,
+        "train_kernel_condition_number_above_1e-12_relative_floor": resolved_condition,
+        "train_kernel_offdiagonal_mean": float((Ktr.sum() - np.trace(Ktr)) / max(1, Ktr.size - len(Ktr))),
+        "decision_score_center": center, "decision_score_scale": spread,
+        "projected_kernel_gamma": actual_gamma,
+        "projection_order": cfg.get("projection_order"),
     }
-    with open(outputs_dir / "best_config.json", "w") as f:
-        json.dump(best_config_export, f, indent=4)
 
-    # -----------------------------------------------------------------------
-    # Step D: Final Training & Test Evaluation of QSVM (Threshold 0.0 vs Tuned)
-    # -----------------------------------------------------------------------
-    print("=" * 78)
-    print("  FINAL QSVM EVALUATION ON TEST SET (25% Unseen Samples)")
-    print("=" * 78)
-    # Fit preprocessing pipeline on entire X_train, transform X_test
-    X_tr_q, X_te_q, scaler_final, reducer_final, minmax_final = build_preprocessed_fold(
-        X_train, y_train, X_test,
-        best_cfg["reducer"], int(best_cfg["qubits"]), float(best_cfg["scale"])
-    )
-    states_train = compute_statevectors(
-        X_tr_q, int(best_cfg["qubits"]), int(best_cfg["reps"]), str(best_cfg["entanglement"])
-    )
-    states_test = compute_statevectors(
-        X_te_q, int(best_cfg["qubits"]), int(best_cfg["reps"]), str(best_cfg["entanglement"])
-    )
-    K_train_final = compute_kernel_matrix(states_train)
-    K_test_final = compute_kernel_matrix(states_test, states_train)
 
-    qsvm_final = SVC(kernel="precomputed", C=float(best_cfg["C"]))
-    qsvm_final.fit(K_train_final, y_train)
+def predict_frame(model_bundle: dict, frame: pd.DataFrame) -> pd.DataFrame:
+    """Run research inference with a bundle saved by this script."""
+    expected = model_bundle["feature_names"]
+    missing = sorted(set(expected) - set(frame.columns))
+    if missing:
+        raise ValueError(f"Missing input features: {missing}")
+    X = frame[expected].apply(pd.to_numeric, errors="raise")
+    encoder = model_bundle["encoder"]
+    encoded = encoder.transform(X)
+    reduced = model_bundle["reducer"].transform(encoded)
+    transformed = model_bundle["minmax"].transform(reduced)
+    cfg = model_bundle["config"]
+    states = statevectors(transformed, cfg["qubits"], cfg["reps"], cfg["entanglement"])
+    k_eval = quantum_kernel_pair(model_bundle["train_statevectors"], states,
+                                 cfg, cfg["qubits"])[1]
+    raw = model_bundle["classifier"].decision_function(k_eval)
+    normalized = (raw - model_bundle["score_center"]) / model_bundle["score_scale"]
+    threshold = model_bundle["threshold"]
+    return pd.DataFrame({"decision_score": normalized, "threshold": threshold,
+                         "prediction": (normalized >= threshold).astype(int)})
 
-    qsvm_test_scores = qsvm_final.decision_function(K_test_final)
-    qsvm_test_pred_default = (qsvm_test_scores >= 0.0).astype(int)
-    qsvm_test_pred_tuned = (qsvm_test_scores >= tuned_threshold).astype(int)
 
-    metrics_qsvm_default = compute_all_metrics(y_test, qsvm_test_pred_default, qsvm_test_scores)
-    metrics_qsvm_tuned = compute_all_metrics(y_test, qsvm_test_pred_tuned, qsvm_test_scores)
+def classical_all_fold_scores(X: pd.DataFrame, y: np.ndarray, splits, seed: int, folds: int):
+    scores = np.zeros(len(y))
+    grid = {"svc__C": [0.1, 1.0, 10.0, 100.0],
+            "svc__gamma": ["scale", "auto", 0.01, 0.1, 1.0]}
+    for fold, (it, iv) in enumerate(splits):
+        pipe = Pipeline([("encode", make_encoder(X.iloc[it])), ("svc", SVC(kernel="rbf"))])
+        search = GridSearchCV(pipe, grid, cv=StratifiedKFold(folds, shuffle=True, random_state=seed + fold),
+                              scoring="roc_auc", n_jobs=1, refit=True)
+        search.fit(X.iloc[it], y[it])
+        estimator = search.best_estimator_
+        train_scores = estimator.decision_function(X.iloc[it])
+        eval_scores = estimator.decision_function(X.iloc[iv])
+        scores[iv] = (eval_scores - train_scores.mean()) / (train_scores.std() or 1.0)
+    return scores
 
-    # -----------------------------------------------------------------------
-    # Step E: Tuned Classical Baselines (GridSearchCV on X_train)
-    # -----------------------------------------------------------------------
-    print("=" * 78)
-    print("  TUNED CLASSICAL RBF-SVM BASELINES")
-    print("=" * 78)
-    param_grid_rbf = {
-        "svm__C": [0.1, 1.0, 10.0, 100.0],
-        "svm__gamma": ["scale", "auto", 0.01, 0.1, 1.0],
-    }
-    cv_strategy = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
-    # Baseline A: All 13 features
-    pipe_baseline_all = Pipeline([
-        ("scaler", StandardScaler()),
-        ("svm", SVC(kernel="rbf"))
-    ])
-    grid_all = GridSearchCV(pipe_baseline_all, param_grid_rbf, cv=cv_strategy, scoring="roc_auc", n_jobs=-1)
-    grid_all.fit(X_train, y_train)
-    baseline_all_scores = grid_all.best_estimator_.decision_function(X_test)
-    baseline_all_preds = grid_all.best_estimator_.predict(X_test)
-    metrics_baseline_all = compute_all_metrics(y_test, baseline_all_preds, baseline_all_scores)
-    print(f"Baseline A (All 13 features)     : Best params = {grid_all.best_params_} | CV AUC = {grid_all.best_score_:.4f}")
+def classical_reduced_cv(X: pd.DataFrame, y: np.ndarray, splits, cfg: dict, seed: int, folds: int):
+    """Tune an RBF SVM on the same fold-local reduced representation as QSVM."""
+    grid = [(C, gamma) for C in [0.1, 1.0, 10.0, 100.0]
+            for gamma in ["scale", "auto", 0.01, 0.1, 1.0]]
+    oof = {p: np.zeros(len(y)) for p in grid}
+    fold_auc = {p: [] for p in grid}
+    for fold, (it, iv) in enumerate(splits):
+        A, B, *_ = fit_representation(X.iloc[it], y[it], X.iloc[iv], cfg["reducer"],
+                                      cfg["qubits"], cfg["scale"], seed + fold)
+        for C, gamma in grid:
+            clf = SVC(kernel="rbf", C=C, gamma=gamma).fit(A, y[it])
+            train_score = clf.decision_function(A)
+            val_score = clf.decision_function(B)
+            normalized = (val_score - train_score.mean()) / (train_score.std() or 1.0)
+            oof[(C, gamma)][iv] = normalized
+            fold_auc[(C, gamma)].append(float(roc_auc_score(y[iv], normalized)))
+    best_params = max(grid, key=lambda p: (np.mean(fold_auc[p]), -np.std(fold_auc[p])))
+    tau, f2 = choose_threshold(oof[best_params], y)
+    return best_params, oof[best_params], tau, f2
 
-    # Baseline B: Reduced input matching QSVM
-    if best_cfg["reducer"] == "mi":
-        red_b = SelectKBest(score_func=mutual_info_classif, k=int(best_cfg["qubits"]))
-    else:
-        red_b = PCA(n_components=int(best_cfg["qubits"]), random_state=42)
 
-    pipe_baseline_reduced = Pipeline([
-        ("scaler", StandardScaler()),
-        ("reducer", red_b),
-        ("minmax", MinMaxScaler(feature_range=(0, float(best_cfg["scale"])))),
-        ("svm", SVC(kernel="rbf"))
-    ])
-    grid_reduced = GridSearchCV(pipe_baseline_reduced, param_grid_rbf, cv=cv_strategy, scoring="roc_auc", n_jobs=-1)
-    grid_reduced.fit(X_train, y_train)
-    baseline_reduced_scores = grid_reduced.best_estimator_.decision_function(X_test)
-    baseline_reduced_preds = grid_reduced.best_estimator_.predict(X_test)
-    metrics_baseline_reduced = compute_all_metrics(y_test, baseline_reduced_preds, baseline_reduced_scores)
-    print(f"Baseline B (Reduced {best_cfg['qubits']} features): Best params = {grid_reduced.best_params_} | CV AUC = {grid_reduced.best_score_:.4f}\n")
+def run(quick=False, dataset_path=None, target_column=None, outer_folds=5, inner_folds=5,
+        jobs=None, seed=SEED):
+    started = time.perf_counter()
+    OUT.mkdir(parents=True, exist_ok=True)
+    X, y, data_path, dropped = load_data(dataset_path, target_column)
+    if outer_folds < 3 or inner_folds < 3:
+        raise ValueError("Nested CV needs at least 3 outer and inner folds.")
+    configs, c_values = circuit_groups(quick)
+    # Group grids so encodings and statevectors are shared where possible.
+    groups = {}
+    for cfg in configs:
+        key = (cfg["reducer"], cfg["qubits"], cfg["scale"])
+        groups.setdefault(key, {**{k: cfg[k] for k in ("reducer", "qubits", "scale")}, "configs": []})
+        groups[key]["configs"].append(cfg)
+    n_jobs = jobs or min(4, len(groups), os.cpu_count() or 1)
+    outer = StratifiedKFold(outer_folds, shuffle=True, random_state=seed)
+    outer_rows, all_search_rows, fold_details = [], [], []
+    for outer_i, (it, iv) in enumerate(outer.split(X, y), 1):
+        print(f"Outer fold {outer_i}/{outer_folds}: inner tuning over {len(configs) * len(c_values)} settings", flush=True)
+        Xtr, Xev, ytr, yev = X.iloc[it], X.iloc[iv], y[it], y[iv]
+        inner_splits = list(StratifiedKFold(inner_folds, shuffle=True,
+                                             random_state=seed + outer_i).split(Xtr, ytr))
+        batches = Parallel(n_jobs=n_jobs, verbose=0)(
+            delayed(evaluate_group)(group, Xtr, ytr, c_values, inner_folds, seed + outer_i)
+            for group in groups.values())
+        candidates = [r for batch in batches for r in batch]
+        ranked = sorted(candidates, key=lambda r: (r["mean_cv_roc_auc"], r["std_cv_roc_auc"] * -1), reverse=True)
+        best = ranked[0]
+        threshold, inner_f2 = choose_threshold(best["oof_scores"], ytr)
+        scores, fitted, diag = fit_quantum(Xtr, ytr, Xev, best, seed + outer_i)
+        qmetrics = metric_row(yev, scores, threshold)
+        # Classical all-feature baseline follows the same outer split; its threshold is 0.
+        all_scores = classical_all_fold_scores(Xtr, ytr, inner_splits, seed + outer_i, inner_folds)
+        all_tau, all_f2 = choose_threshold(all_scores, ytr)
+        allpipe = Pipeline([("encode", make_encoder(Xtr)), ("svc", SVC(kernel="rbf"))])
+        allgrid = GridSearchCV(allpipe, {"svc__C": [0.1, 1, 10, 100],
+                                       "svc__gamma": ["scale", "auto", .01, .1, 1.]},
+                               cv=StratifiedKFold(inner_folds, shuffle=True, random_state=seed + outer_i),
+                               scoring="roc_auc", n_jobs=1).fit(Xtr, ytr)
+        all_test_scores = allgrid.best_estimator_.decision_function(Xev)
+        # Normalize the final SVC's scores using its training-score distribution.
+        all_train_scores = allgrid.best_estimator_.decision_function(Xtr)
+        all_test_scores = (all_test_scores - all_train_scores.mean()) / (all_train_scores.std() or 1.0)
+        # Inner OOF scores are standardized per fold; final scores use the analogous model normalization.
+        classical_all = metric_row(yev, all_test_scores, all_tau)
+        reduced_params, reduced_oof, reduced_tau, reduced_f2 = classical_reduced_cv(
+            Xtr, ytr, inner_splits, best, seed + outer_i, inner_folds)
+        red_A, red_B, *_ = fit_representation(Xtr, ytr, Xev, best["reducer"],
+                                               best["qubits"], best["scale"], seed + outer_i)
+        reduced_clf = SVC(kernel="rbf", C=reduced_params[0], gamma=reduced_params[1]).fit(red_A, ytr)
+        red_train_scores = reduced_clf.decision_function(red_A)
+        red_test_scores = (reduced_clf.decision_function(red_B) - red_train_scores.mean()) / (red_train_scores.std() or 1.0)
+        classical_reduced = metric_row(yev, red_test_scores, reduced_tau)
+        row_base = {"outer_fold": outer_i, "train_n": len(it), "test_n": len(iv)}
+        outer_rows.extend([{**row_base, "Model": "QSVM", **qmetrics},
+                           {**row_base, "Model": "Classical RBF (all features)", **classical_all},
+                           {**row_base, "Model": "Classical RBF (same reduced input)", **classical_reduced}])
+        fold_details.append({"outer_fold": outer_i, "selected_config": {k: v for k, v in best.items()
+                              if k not in ("oof_scores",)}, "threshold": threshold,
+                            "inner_oof_f2": inner_f2, "classical_threshold": all_tau,
+                            "classical_inner_oof_f2": all_f2, "classical_best_params": allgrid.best_params_,
+                            "classical_reduced_threshold": reduced_tau,
+                            "classical_reduced_inner_oof_f2": reduced_f2,
+                            "classical_reduced_best_params": {"C": reduced_params[0], "gamma": reduced_params[1]},
+                            "kernel_diagnostics": diag})
+        for r in candidates:
+            all_search_rows.append({"outer_fold": outer_i, **{k: v for k, v in r.items() if k != "oof_scores"}})
+        proj_text = (f", projected order={best['projection_order']} gamma x={best['gamma_multiplier']}"
+                     if best["kernel_type"] == "projected" else "")
+        print(f"  QSVM AUC={qmetrics['ROC-AUC']:.3f}, recall={qmetrics['Recall']:.3f}, "
+              f"specificity={qmetrics['Specificity']:.3f}; selected {best['reducer']}/{best['qubits']}q "
+              f"reps={best['reps']} {best['entanglement']} {best['kernel_type']}{proj_text} "
+              f"C={best['C']} scale={best['scale']:.3g}", flush=True)
 
-    # -----------------------------------------------------------------------
-    # Step F: Compile Results Table
-    # -----------------------------------------------------------------------
-    results_rows = [
-        {"Model": "QSVM (Default Thr = 0.0)", "Threshold": 0.0, **metrics_qsvm_default},
-        {"Model": f"QSVM (Tuned Thr = {tuned_threshold:+.4f})", "Threshold": tuned_threshold, **metrics_qsvm_tuned},
-        {"Model": "Classical RBF-SVM (All 13 Features)", "Threshold": 0.0, **metrics_baseline_all},
-        {"Model": f"Classical RBF-SVM ({best_cfg['qubits']} Features)", "Threshold": 0.0, **metrics_baseline_reduced},
-    ]
-    df_results = pd.DataFrame(results_rows)
-    df_results.to_csv(outputs_dir / "results_table.csv", index=False)
+    results = pd.DataFrame(outer_rows)
+    results.to_csv(OUT / "nested_cv_fold_results.csv", index=False)
+    pd.DataFrame(all_search_rows).to_csv(OUT / "nested_cv_search_results.csv", index=False)
+    summary = results.groupby("Model")[["Accuracy", "Precision", "Recall", "Specificity", "F1", "ROC-AUC"]].agg(["mean", "std"])
+    summary.to_csv(OUT / "nested_cv_summary.csv")
+    with open(OUT / "nested_cv_details.json", "w", encoding="utf-8") as f:
+        json.dump(fold_details, f, indent=2)
 
-    print("=" * 78)
-    print("  TEST BENCHMARK RESULTS TABLE")
-    print("=" * 78)
-    display_cols = ["Model", "Accuracy", "Precision", "Recall", "Specificity", "F1", "ROC-AUC", "TN", "FP", "FN", "TP"]
-    print(df_results[display_cols].to_string(index=False))
-    print()
+    # Refit a final review artifact on all data. Its settings are selected by inner CV;
+    # nested outer results above remain the unbiased procedure-level estimate.
+    print("Selecting final review configuration on all data...", flush=True)
+    full_splits = list(StratifiedKFold(inner_folds, shuffle=True, random_state=seed).split(X, y))
+    full_batches = Parallel(n_jobs=n_jobs)(delayed(evaluate_group)(group, X, y, c_values,
+                                                                  inner_folds, seed)
+                                          for group in groups.values())
+    final_candidates = [r for batch in full_batches for r in batch]
+    final_best = max(final_candidates, key=lambda r: r["mean_cv_roc_auc"])
+    final_threshold, final_f2 = choose_threshold(final_best["oof_scores"], y)
+    # Fit estimators and save deployable inference components only if joblib is available.
+    final_scores, fitted, final_diag = fit_quantum(X, y, X, final_best, seed)
+    final_config = {k: v for k, v in final_best.items() if k != "oof_scores"}
+    data_sha = hashlib.sha256(data_path.read_bytes()).hexdigest()
+    metadata = {"dataset_path": str(data_path), "dataset_sha256": data_sha,
+                "rows_used": int(len(y)), "rows_dropped": dropped,
+                "features": list(X.columns), "categorical_features_one_hot": [c for c in X.columns if c.lower() in CATEGORICAL],
+                "positive_label_rule": "target > 0 maps to disease (1); target 0 maps to no disease (0)",
+                "outer_folds": outer_folds, "inner_folds": inner_folds, "seed": seed,
+                "quick_mode": quick, "parallel_jobs": n_jobs,
+                "search_space_size_per_outer_fold": len(configs) * len(c_values),
+                "best_full_data_config": final_config, "oof_threshold_normalized_margin": final_threshold,
+                "inner_oof_f2": final_f2, "final_kernel_diagnostics": final_diag,
+                "python": platform.python_version(), "numpy": np.__version__, "pandas": pd.__version__,
+                "scikit_learn": sklearn.__version__, "qiskit": qiskit.__version__,
+                "elapsed_seconds": round(time.perf_counter() - started, 3)}
+    (OUT / "run_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    try:
+        import joblib
+        joblib.dump({"encoder": fitted[0], "reducer": fitted[1], "minmax": fitted[2],
+                     "classifier": fitted[3], "train_statevectors": fitted[4],
+                     "feature_names": list(X.columns), "config": final_config,
+                     "score_center": final_diag["decision_score_center"],
+                     "score_scale": final_diag["decision_score_scale"],
+                     "threshold": final_threshold}, OUT / "qsvm_review_model.joblib", compress=3)
+    except Exception as exc:
+        warnings.warn(f"Could not save inference artifact: {exc}")
 
-    # -----------------------------------------------------------------------
-    # Step G: Generate Figures (Confusion Matrix & ROC Curves)
-    # -----------------------------------------------------------------------
-    # 1. Confusion Matrix for QSVM (Tuned Threshold)
-    fig_cm, ax_cm = plt.subplots(figsize=(6, 5))
-    cm = confusion_matrix(y_test, qsvm_test_pred_tuned, labels=[0, 1])
-    cax = ax_cm.matshow(cm, cmap="Blues", alpha=0.85)
-    for i in range(2):
-        for j in range(2):
-            val = cm[i, j]
-            label = f"{val}\n({'TN' if (i==0 and j==0) else 'FP' if (i==0 and j==1) else 'FN' if (i==1 and j==0) else 'TP'})"
-            ax_cm.text(j, i, label, ha="center", va="center", fontsize=12, fontweight="bold",
-                       color="black" if cm[i, j] < cm.max()/2 else "white")
-    ax_cm.set_xticks([0, 1])
-    ax_cm.set_yticks([0, 1])
-    ax_cm.set_xticklabels(["No Disease (0)", "Disease (1)"])
-    ax_cm.set_yticklabels(["No Disease (0)", "Disease (1)"])
-    ax_cm.set_xlabel("Predicted Label", fontsize=11, fontweight="bold")
-    ax_cm.set_ylabel("True Label", fontsize=11, fontweight="bold")
-    ax_cm.set_title(f"QSVM Confusion Matrix (Tuned Thr = {tuned_threshold:+.3f})\n"
-                    f"Recall={metrics_qsvm_tuned['Recall']:.2%}, Specificity={metrics_qsvm_tuned['Specificity']:.2%}",
-                    fontsize=12, pad=15)
-    plt.colorbar(cax, ax=ax_cm, fraction=0.046, pad=0.04)
-    plt.tight_layout()
-    fig_cm.savefig(outputs_dir / "confusion_matrix_qsvm_tuned.png", dpi=300)
-    plt.close(fig_cm)
-    print(f"[*] Saved confusion matrix plot to: {outputs_dir / 'confusion_matrix_qsvm_tuned.png'}")
+    # Concise review report with fold-level results and explicit interpretation.
+    lines = ["# Nested CV model review", "", f"Dataset: `{data_path.name}` ({len(y)} rows used; {dropped} dropped)",
+             f"Outer/inner CV: {outer_folds} × {inner_folds}; seed {seed}; mode: {'quick' if quick else 'full'}", "",
+             "## Outer-fold performance", "",
+             "Scores below are the procedure-level estimate. Model settings and the threshold were selected using only each outer training partition.", "",
+             "| Model | Accuracy | Precision | Recall | Specificity | F1 | ROC-AUC |", "|---|---:|---:|---:|---:|---:|---:|"]
+    for name, group in results.groupby("Model"):
+        vals = []
+        for m in ["Accuracy", "Precision", "Recall", "Specificity", "F1", "ROC-AUC"]:
+            vals.append(f"{group[m].mean():.3f} ± {group[m].std(ddof=1):.3f}")
+        lines.append(f"| {name} | " + " | ".join(vals) + " |")
+    q = results[results["Model"] == "QSVM"]
+    classical = results[results["Model"] == "Classical RBF (all features)"]
+    q_auc = q["ROC-AUC"].mean()
+    c_auc = classical["ROC-AUC"].mean()
+    q_acc = q["Accuracy"].mean()
+    c_acc = classical["Accuracy"].mean()
+    configs_by_fold = []
+    for d in fold_details:
+        cfg = d["selected_config"]
+        kernel_desc = (f"projected order {cfg['projection_order']} γ×{cfg['gamma_multiplier']}"
+                       if cfg["kernel_type"] == "projected" else "fidelity")
+        configs_by_fold.append(f"fold {d['outer_fold']}: {cfg['reducer']}/{cfg['qubits']}q, "
+                               f"reps={cfg['reps']}, {cfg['entanglement']}, {kernel_desc}")
+    lines += ["", "## Interpretation", "",
+              f"The expanded 8-qubit projected QSVM had mean outer-fold ROC-AUC {q_auc:.3f} and accuracy {q_acc:.3f}; "
+              f"the all-feature classical RBF-SVM scored {c_auc:.3f} AUC and {c_acc:.3f} accuracy "
+              f"(QSVM minus classical: {q_auc-c_auc:+.3f} AUC, {q_acc-c_acc:+.3f} accuracy). "
+              "This is a modest predictive edge in this five-fold run, not evidence of a statistically robust "
+              "or computational quantum advantage; the fold-to-fold uncertainty is substantial and the final "
+              "projected kernel is highly concentrated.",
+              f"The QSVM threshold averaged {q['Recall'].mean():.3f} recall and "
+              f"{q['Specificity'].mean():.3f} specificity; its fold-specific tradeoff varies, so these values "
+              "should not be read as clinical validation.",
+              "Selected quantum settings by outer fold: " + "; ".join(configs_by_fold) + "."]
+    lines += ["", "## Per-fold results", "", "| Fold | Model | Accuracy | Recall | Specificity | ROC-AUC | TN | FP | FN | TP |",
+              "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    for _, r in results.iterrows():
+        lines.append(f"| {int(r.outer_fold)} | {r.Model} | {r.Accuracy:.3f} | {r.Recall:.3f} | {r.Specificity:.3f} | {r['ROC-AUC']:.3f} | {int(r.TN)} | {int(r.FP)} | {int(r.FN)} | {int(r.TP)} |")
+    lines += ["", "## Final full-data review artifact", "",
+              "The separately refit artifact uses settings chosen by CV over all available data. Do not treat its training/CV scores as an independent performance estimate.",
+              f"", f"- Selected settings: `{json.dumps(final_config, sort_keys=True)}`",
+              f"- OOF F2 threshold on standardized margin: `{final_threshold:.6g}` (OOF F2 `{final_f2:.3f}`)",
+              f"- Training-kernel diagnostics: `{json.dumps(final_diag, sort_keys=True)}`", "",
+              "## Files", "", "- `nested_cv_fold_results.csv`: outer-fold metrics.",
+              "- `nested_cv_search_results.csv`: inner-search scores for each outer fold.",
+              "- `nested_cv_details.json`: selected settings, thresholds, and kernel diagnostics per outer fold.",
+              "- `nested_cv_summary.csv`: mean and standard deviation by model.",
+              "- `run_metadata.json`: dataset hash, configuration, environment, and runtime.",
+              "- `qsvm_review_model.joblib`: fitted full-data inference artifact; for research review only, not clinical use.", ""]
+    (OUT / "review_report.md").write_text("\n".join(lines), encoding="utf-8")
+    print(f"\nComplete in {metadata['elapsed_seconds']:.1f}s. Review: {OUT / 'review_report.md'}", flush=True)
 
-    # 2. Combined ROC Curves
-    fig_roc, ax_roc = plt.subplots(figsize=(7, 6))
-    fpr_q, tpr_q, _ = roc_curve(y_test, qsvm_test_scores)
-    fpr_b1, tpr_b1, _ = roc_curve(y_test, baseline_all_scores)
-    fpr_b2, tpr_b2, _ = roc_curve(y_test, baseline_reduced_scores)
 
-    ax_roc.plot(fpr_q, tpr_q, color="#1f77b4", lw=2.5,
-                label=f"QSVM ({best_cfg['qubits']}q, {best_cfg['reducer'].upper()}) [AUC = {metrics_qsvm_tuned['ROC-AUC']:.4f}]")
-    ax_roc.plot(fpr_b1, tpr_b1, color="#2ca02c", lw=2, linestyle="--",
-                label=f"Classical RBF-SVM (All 13) [AUC = {metrics_baseline_all['ROC-AUC']:.4f}]")
-    ax_roc.plot(fpr_b2, tpr_b2, color="#ff7f0e", lw=2, linestyle="-.",
-                label=f"Classical RBF-SVM ({best_cfg['qubits']} feats) [AUC = {metrics_baseline_reduced['ROC-AUC']:.4f}]")
-    ax_roc.plot([0, 1], [0, 1], color="grey", lw=1, linestyle=":", label="Chance (AUC = 0.5000)")
-
-    ax_roc.set_xlim([-0.02, 1.02])
-    ax_roc.set_ylim([-0.02, 1.02])
-    ax_roc.set_xlabel("False Positive Rate (1 - Specificity)", fontsize=11, fontweight="bold")
-    ax_roc.set_ylabel("True Positive Rate (Recall / Sensitivity)", fontsize=11, fontweight="bold")
-    ax_roc.set_title("Receiver Operating Characteristic (ROC) Comparison\nCleveland Heart Disease Dataset", fontsize=12)
-    ax_roc.legend(loc="lower right", fontsize=10, frameon=True)
-    ax_roc.grid(True, alpha=0.3)
-    plt.tight_layout()
-    fig_roc.savefig(outputs_dir / "roc_curves_comparison.png", dpi=300)
-    plt.close(fig_roc)
-    print(f"[*] Saved ROC comparison plot to: {outputs_dir / 'roc_curves_comparison.png'}\n")
-
-    # -----------------------------------------------------------------------
-    # Step H: Multi-Seed Robustness Evaluation (5 Random Seeds)
-    # -----------------------------------------------------------------------
-    print("=" * 78)
-    print("  MULTI-SEED ROBUSTNESS EVALUATION (5 SEEDS: [42, 123, 7, 999, 2026])")
-    print("  *Caveat: Hyperparameters fixed to seed-42 training split choice")
-    print("=" * 78)
-    seeds = [42, 123, 7, 999, 2026]
-    seed_records = []
-
-    for s in seeds:
-        X_tr_s, X_te_s, y_tr_s, y_te_s = train_test_split(
-            X, y, test_size=0.25, stratify=y, random_state=s
-        )
-        X_tr_sq, X_te_sq, _, _, _ = build_preprocessed_fold(
-            X_tr_s, y_tr_s, X_te_s,
-            best_cfg["reducer"], int(best_cfg["qubits"]), float(best_cfg["scale"])
-        )
-        st_tr = compute_statevectors(
-            X_tr_sq, int(best_cfg["qubits"]), int(best_cfg["reps"]), str(best_cfg["entanglement"])
-        )
-        st_te = compute_statevectors(
-            X_te_sq, int(best_cfg["qubits"]), int(best_cfg["reps"]), str(best_cfg["entanglement"])
-        )
-        K_tr_s = compute_kernel_matrix(st_tr)
-        K_te_s = compute_kernel_matrix(st_te, st_tr)
-
-        clf_s = SVC(kernel="precomputed", C=float(best_cfg["C"]))
-        clf_s.fit(K_tr_s, y_tr_s)
-        scores_s = clf_s.decision_function(K_te_s)
-        preds_s_default = (scores_s >= 0.0).astype(int)
-        preds_s_tuned = (scores_s >= tuned_threshold).astype(int)
-
-        m_def = compute_all_metrics(y_te_s, preds_s_default, scores_s)
-        m_tun = compute_all_metrics(y_te_s, preds_s_tuned, scores_s)
-
-        seed_records.append({"seed": s, "type": "default", **m_def})
-        seed_records.append({"seed": s, "type": "tuned", **m_tun})
-
-    df_seed_records = pd.DataFrame(seed_records)
-    
-    summary_rows = []
-    for m_type in ["default", "tuned"]:
-        sub = df_seed_records[df_seed_records["type"] == m_type]
-        row_dict = {"Configuration": f"QSVM ({'Default Thr' if m_type=='default' else 'Tuned Thr'})"}
-        for metric_name in ["Accuracy", "Precision", "Recall", "Specificity", "F1", "ROC-AUC"]:
-            vals = sub[metric_name].values
-            row_dict[metric_name] = f"{np.mean(vals):.4f} +/- {np.std(vals):.4f}"
-        summary_rows.append(row_dict)
-
-    df_seed_summary = pd.DataFrame(summary_rows)
-    df_seed_summary.to_csv(outputs_dir / "multi_seed_summary.csv", index=False)
-    print(df_seed_summary.to_string(index=False))
-    print()
-
-    # -----------------------------------------------------------------------
-    # Step I: Sample Test Predictions & Custom Patient Verification
-    # -----------------------------------------------------------------------
-    print("=" * 78)
-    print("  SAMPLE INFERENCE TESTING (8 Random Test Set Patients)")
-    print("=" * 78)
-    rng = np.random.default_rng(42)
-    sample_indices = rng.choice(len(X_test), size=min(8, len(X_test)), replace=False)
-    sample_rows = []
-    for idx in sample_indices:
-        actual = y_test[idx]
-        p_def = qsvm_test_pred_default[idx]
-        p_tun = qsvm_test_pred_tuned[idx]
-        score = qsvm_test_scores[idx]
-        sample_rows.append({
-            "Test_Idx": idx,
-            "Actual": "Disease (1)" if actual == 1 else "No Disease (0)",
-            "Score": f"{score:+.4f}",
-            "Pred_Default": "Disease (1)" if p_def == 1 else "No Disease (0)",
-            "Pred_Tuned": "Disease (1)" if p_tun == 1 else "No Disease (0)",
-            "Status": "CORRECT" if p_tun == actual else "MISS",
-        })
-    df_samples = pd.DataFrame(sample_rows)
-    print(df_samples.to_string(index=False))
-    print()
-
-    print("=" * 78)
-    print("  CUSTOM CLINICAL PATIENT TEST")
-    print("=" * 78)
-    custom_patient = {
-        "age": 58, "sex": 1, "cp": 4, "trestbps": 140, "chol": 260, "fbs": 0,
-        "restecg": 2, "thalach": 120, "exang": 1, "oldpeak": 2.4, "slope": 2,
-        "ca": 2, "thal": 7,
-    }
-    df_custom = pd.DataFrame([custom_patient])[feature_names]
-    # Transform custom patient with fitted pipeline
-    custom_s = scaler_final.transform(df_custom.values)
-    custom_r = reducer_final.transform(custom_s)
-    custom_q = minmax_final.transform(custom_r)
-    custom_state = compute_statevectors(
-        custom_q, int(best_cfg["qubits"]), int(best_cfg["reps"]), str(best_cfg["entanglement"])
-    )
-    custom_kernel = compute_kernel_matrix(custom_state, states_train)
-    custom_score = float(qsvm_final.decision_function(custom_kernel)[0])
-    custom_pred_default = int(custom_score >= 0.0)
-    custom_pred_tuned = int(custom_score >= tuned_threshold)
-
-    print("Patient Clinical Profile:")
-    for k, v in custom_patient.items():
-        print(f"  {k:<10s}: {v}")
-    print(f"Decision Function Score   : {custom_score:+.4f}")
-    print(f"Default Prediction (Thr=0): {'Disease (1)' if custom_pred_default==1 else 'No Disease (0)'}")
-    print(f"Tuned Prediction   (Thr={tuned_threshold:+.3f}): {'Disease (1)' if custom_pred_tuned==1 else 'No Disease (0)'}\n")
-
-    # -----------------------------------------------------------------------
-    # Step J: Console Summary for Slide Placeholders & Academic Abstract
-    # -----------------------------------------------------------------------
-    t_total = time.time() - t_start
-    print("=" * 78)
-    print("  CONSOLE SUMMARY FOR SLIDE PLACEHOLDERS [X] & ACADEMIC ABSTRACT")
-    print("=" * 78)
-    print(f"""
-[SLIDE BULLET 1 - BEST HYPERPARAMETERS]
-- Quantum Circuit : ZZFeatureMap (reps={int(best_cfg['reps'])}, entanglement='{best_cfg['entanglement']}')
-- Feature Reducer : {best_cfg['reducer'].upper()} (k={int(best_cfg['qubits'])} qubits)
-- Feature Scaling : [0, {best_cfg['scale']:.4f}]
-- Classifier      : SVC(C={best_cfg['C']}, kernel='precomputed')
-- Threshold       : {tuned_threshold:+.4f} (tuned via OOF F2-score)
-
-[SLIDE BULLET 2 - TEST PERFORMANCE COMPARISON]
-- QSVM (Tuned Thr): Accuracy={metrics_qsvm_tuned['Accuracy']:.2%}, Recall={metrics_qsvm_tuned['Recall']:.2%}, Specificity={metrics_qsvm_tuned['Specificity']:.2%}, AUC={metrics_qsvm_tuned['ROC-AUC']:.4f}
-- QSVM (Def. Thr) : Accuracy={metrics_qsvm_default['Accuracy']:.2%}, Recall={metrics_qsvm_default['Recall']:.2%}, Specificity={metrics_qsvm_default['Specificity']:.2%}, AUC={metrics_qsvm_default['ROC-AUC']:.4f}
-- Classical RBF 13: Accuracy={metrics_baseline_all['Accuracy']:.2%}, Recall={metrics_baseline_all['Recall']:.2%}, Specificity={metrics_baseline_all['Specificity']:.2%}, AUC={metrics_baseline_all['ROC-AUC']:.4f}
-- Classical RBF {best_cfg['qubits']}: Accuracy={metrics_baseline_reduced['Accuracy']:.2%}, Recall={metrics_baseline_reduced['Recall']:.2%}, Specificity={metrics_baseline_reduced['Specificity']:.2%}, AUC={metrics_baseline_reduced['ROC-AUC']:.4f}
-
-[SLIDE BULLET 3 - MULTI-SEED STABILITY (5 SEEDS)]
-- QSVM Accuracy   : {df_seed_summary.loc[df_seed_summary['Configuration']=='QSVM (Tuned Thr)', 'Accuracy'].values[0]}
-- QSVM Recall     : {df_seed_summary.loc[df_seed_summary['Configuration']=='QSVM (Tuned Thr)', 'Recall'].values[0]}
-- QSVM ROC-AUC    : {df_seed_summary.loc[df_seed_summary['Configuration']=='QSVM (Tuned Thr)', 'ROC-AUC'].values[0]}
-
-[ABSTRACT SNIPPET]
-"Using a leak-free 5-fold cross-validated grid search over feature reducers, qubit allocations,
-circuit depths, and entanglement topologies on the 297-sample Cleveland dataset, the optimized
-QSVM achieved an ROC-AUC of {metrics_qsvm_tuned['ROC-AUC']:.4f} and {metrics_qsvm_tuned['Accuracy']:.2%} accuracy.
-By optimizing the decision boundary for clinical recall via out-of-fold F2 tuning, sensitivity
-reached {metrics_qsvm_tuned['Recall']:.2%} (specificity {metrics_qsvm_tuned['Specificity']:.2%}). In comparison,
-the fully-tuned classical RBF-SVM baseline achieved an ROC-AUC of {metrics_baseline_all['ROC-AUC']:.4f} and {metrics_baseline_all['Accuracy']:.2%}
-accuracy, demonstrating parity between shallow quantum kernels and classical non-linear baselines
-under rigorous experimental protocols without quantum advantage claims."
-
-Total Pipeline Runtime: {t_total:.1f} seconds ({t_total/60:.2f} minutes).
-""")
-    print("=" * 78)
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--quick", action="store_true", help="Use a small search space for a quick pipeline run")
+    parser.add_argument("--dataset-path", help="CSV path; defaults to the bundled Cleveland dataset")
+    parser.add_argument("--target-column", help="Target column name; defaults to the final CSV column")
+    parser.add_argument("--outer-folds", type=int, default=5)
+    parser.add_argument("--inner-folds", type=int, default=5)
+    parser.add_argument("--jobs", type=int, default=None, help="Parallel circuit-group workers")
+    parser.add_argument("--seed", type=int, default=SEED)
+    args = parser.parse_args()
+    run(args.quick, args.dataset_path, args.target_column, args.outer_folds,
+        args.inner_folds, args.jobs, args.seed)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="QSVM on UCI Heart Disease - Academic Benchmark")
-    parser.add_argument("--quick", action="store_true", help="Run minimal parameter grid for fast debugging")
-    parser.add_argument("--dataset-path", type=str, default=None, help="Optional path to custom 918-record CSV dataset")
-    args = parser.parse_args()
-
-    run_pipeline(quick=args.quick, dataset_path=args.dataset_path)
+    main()

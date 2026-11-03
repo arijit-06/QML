@@ -1,3 +1,4 @@
+> **Historical note:** This write-up records the pre-revision single-split experiment. Its benchmark values and method claims are not the results of the current nested-CV implementation. For current procedure and newly generated measurements, see `README.md` and `outputs/review_report.md`.
 # Quantum Support Vector Machine (QSVM) for Heart Disease Prediction
 ### A Rigorous Comparative Study of Quantum vs. Classical Kernel Methods on the UCI Cleveland Dataset
 

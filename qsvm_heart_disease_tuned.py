@@ -36,6 +36,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import MinMaxScaler, OneHotEncoder, StandardScaler
 from sklearn.svm import SVC
 
+# Keep data and output paths anchored to this script's folder.
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "outputs"
 DEFAULT_DATA = ROOT / "heart_disease_cleveland.csv"
@@ -43,6 +44,7 @@ CATEGORICAL = {"sex", "cp", "fbs", "restecg", "exang", "slope", "ca", "thal"}
 SEED = 42
 
 
+# Read the CSV, remove invalid rows, and convert Cleveland labels to binary classes.
 def load_data(dataset_path: str | None = None, target_column: str | None = None):
     """Load and validate numeric tabular data. Cleveland labels 0..4 map to 0/1."""
     path = Path(dataset_path).expanduser().resolve() if dataset_path else DEFAULT_DATA
@@ -73,6 +75,7 @@ def load_data(dataset_path: str | None = None, target_column: str | None = None)
     return X_df.reset_index(drop=True), y, path, int(len(raw_frame) - len(X_df))
 
 
+# Scale numeric inputs and one-hot encode the known categorical inputs.
 def make_encoder(X: pd.DataFrame) -> ColumnTransformer:
     cats = [c for c in X.columns if c.lower() in CATEGORICAL]
     nums = [c for c in X.columns if c not in cats]
@@ -84,12 +87,14 @@ def make_encoder(X: pd.DataFrame) -> ColumnTransformer:
     return ColumnTransformer(transformers, remainder="drop", verbose_feature_names_out=False)
 
 
+# Identify encoded columns that mutual-information scoring should treat as discrete.
 def encoded_discrete_mask(encoder: ColumnTransformer) -> np.ndarray:
     """Mark one-hot outputs as discrete for mutual-information scoring."""
     names = encoder.get_feature_names_out()
     return np.array(["=" in name or name.split("_")[0].lower() in CATEGORICAL for name in names], dtype=bool)
 
 
+# Fit fold-local encoding, dimensionality reduction, and quantum-angle scaling.
 def fit_representation(X_train: pd.DataFrame, y_train: np.ndarray, X_eval: pd.DataFrame,
                        reducer_name: str, k: int, scale: float, seed: int):
     encoder = make_encoder(X_train).fit(X_train)
@@ -108,6 +113,7 @@ def fit_representation(X_train: pd.DataFrame, y_train: np.ndarray, X_eval: pd.Da
     return scaler.transform(A), scaler.transform(B), encoder, reducer, scaler
 
 
+# Encode each row in a ZZ feature-map circuit and simulate its quantum state.
 def statevectors(X: np.ndarray, n_qubits: int, reps: int, entanglement: str) -> np.ndarray:
     if X.ndim != 2 or X.shape[1] != n_qubits:
         raise ValueError(f"Expected transformed shape (n, {n_qubits}); received {X.shape}.")
@@ -120,11 +126,13 @@ def statevectors(X: np.ndarray, n_qubits: int, reps: int, entanglement: str) -> 
     return np.asarray(rows)
 
 
+# Compute pairwise quantum-state fidelity scores.
 def kernel(A: np.ndarray, B: np.ndarray | None = None) -> np.ndarray:
     B = A if B is None else B
     return np.abs(A @ B.conj().T) ** 2
 
 
+# Convert quantum states to expectation values for local Pauli measurements.
 def projected_observables(states: np.ndarray, n_qubits: int, order: int = 1) -> np.ndarray:
     """Return all Pauli expectations on subsets of up to ``order`` qubits."""
     indices = np.arange(1 << n_qubits)
@@ -149,15 +157,18 @@ def projected_observables(states: np.ndarray, n_qubits: int, order: int = 1) -> 
     return np.column_stack(features)
 
 
+# Return single-qubit Pauli expectations as local state features.
 def local_bloch_features(states: np.ndarray, n_qubits: int) -> np.ndarray:
     return projected_observables(states, n_qubits, order=1)
 
 
+# Compute nonnegative pairwise squared Euclidean distances.
 def squared_distances(A: np.ndarray, B: np.ndarray) -> np.ndarray:
     return np.maximum(0.0, (A * A).sum(axis=1)[:, None] +
                       (B * B).sum(axis=1)[None, :] - 2.0 * A @ B.T)
 
 
+# Build train and evaluation kernels using the selected quantum-kernel definition.
 def quantum_kernel_pair(states_a: np.ndarray, states_b: np.ndarray, cfg: dict,
                         n_qubits: int):
     """Construct either the fidelity or local projected quantum kernel."""
@@ -175,6 +186,7 @@ def quantum_kernel_pair(states_a: np.ndarray, states_b: np.ndarray, cfg: dict,
     return K_train, K_eval, gamma
 
 
+# Rebuild a kernel from cached distances to avoid repeating distance calculations.
 def cached_quantum_kernel(states_a: np.ndarray, states_b: np.ndarray,
                           distances: tuple[np.ndarray, np.ndarray, float], cfg: dict):
     if cfg["kernel_type"] == "fidelity":
@@ -184,6 +196,7 @@ def cached_quantum_kernel(states_a: np.ndarray, states_b: np.ndarray,
     return np.exp(-gamma * d_train), np.exp(-gamma * d_eval)
 
 
+# Normalize evaluation decision scores using the training score distribution.
 def normalized_margin(model: SVC, K_train: np.ndarray, K_eval: np.ndarray):
     train_scores = model.decision_function(K_train)
     center = float(np.mean(train_scores))
@@ -191,6 +204,7 @@ def normalized_margin(model: SVC, K_train: np.ndarray, K_eval: np.ndarray):
     return (model.decision_function(K_eval) - center) / spread, center, spread
 
 
+# Enumerate the circuit, kernel, feature-reduction, and regularization search space.
 def circuit_groups(quick: bool):
     reducers, qubits, reps = (["mi"], [4], [1]) if quick else (["mi", "pca"], [4, 6, 8], [1, 2])
     entanglements = ["linear"] if quick else ["linear", "full"]
@@ -216,6 +230,7 @@ def circuit_groups(quick: bool):
     return configs, c_values
 
 
+# Score one grouped candidate grid with inner-fold out-of-fold predictions.
 def evaluate_group(group: dict, X: pd.DataFrame, y: np.ndarray, c_values: list[float],
                    folds: int, seed: int):
     """Reuse fold encodings across circuit depths/topologies and all C values."""
@@ -263,6 +278,7 @@ def evaluate_group(group: dict, X: pd.DataFrame, y: np.ndarray, c_values: list[f
     return records
 
 
+# Select the decision threshold that maximizes F2 on out-of-fold scores.
 def choose_threshold(scores: np.ndarray, y: np.ndarray):
     thresholds = np.r_[np.unique(scores), np.nextafter(np.max(scores), np.inf)]
     f2s = [fbeta_score(y, scores >= t, beta=2, zero_division=0) for t in thresholds]
@@ -271,6 +287,7 @@ def choose_threshold(scores: np.ndarray, y: np.ndarray):
     return float(thresholds[best]), float(f2s[best])
 
 
+# Calculate classification metrics and confusion-matrix counts at one threshold.
 def metric_row(y: np.ndarray, scores: np.ndarray, threshold: float):
     pred = (scores >= threshold).astype(int)
     tn, fp, fn, tp = confusion_matrix(y, pred, labels=[0, 1]).ravel()
@@ -283,6 +300,7 @@ def metric_row(y: np.ndarray, scores: np.ndarray, threshold: float):
             "TN": int(tn), "FP": int(fp), "FN": int(fn), "TP": int(tp)}
 
 
+# Fit the selected quantum pipeline and return scores, reusable components, and diagnostics.
 def fit_quantum(Xtr, ytr, Xev, cfg, seed):
     A, B, encoder, reducer, scaler = fit_representation(
         Xtr, ytr, Xev, cfg["reducer"], cfg["qubits"], cfg["scale"], seed)
@@ -315,6 +333,7 @@ def fit_quantum(Xtr, ytr, Xev, cfg, seed):
     }
 
 
+# Apply a saved research model bundle to a dataframe of new examples.
 def predict_frame(model_bundle: dict, frame: pd.DataFrame) -> pd.DataFrame:
     """Run research inference with a bundle saved by this script."""
     expected = model_bundle["feature_names"]
@@ -337,6 +356,7 @@ def predict_frame(model_bundle: dict, frame: pd.DataFrame) -> pd.DataFrame:
                          "prediction": (normalized >= threshold).astype(int)})
 
 
+# Tune the full-feature RBF baseline and produce normalized validation scores per fold.
 def classical_all_fold_scores(X: pd.DataFrame, y: np.ndarray, splits, seed: int, folds: int):
     scores = np.zeros(len(y))
     grid = {"svc__C": [0.1, 1.0, 10.0, 100.0],
@@ -353,6 +373,7 @@ def classical_all_fold_scores(X: pd.DataFrame, y: np.ndarray, splits, seed: int,
     return scores
 
 
+# Tune an RBF baseline using the same reduced inputs as a quantum candidate.
 def classical_reduced_cv(X: pd.DataFrame, y: np.ndarray, splits, cfg: dict, seed: int, folds: int):
     """Tune an RBF SVM on the same fold-local reduced representation as QSVM."""
     grid = [(C, gamma) for C in [0.1, 1.0, 10.0, 100.0]
@@ -374,6 +395,7 @@ def classical_reduced_cv(X: pd.DataFrame, y: np.ndarray, splits, cfg: dict, seed
     return best_params, oof[best_params], tau, f2
 
 
+# Run nested evaluation, compare baselines, fit the review model, and write reports.
 def run(quick=False, dataset_path=None, target_column=None, outer_folds=5, inner_folds=5,
         jobs=None, seed=SEED):
     started = time.perf_counter()
@@ -391,6 +413,7 @@ def run(quick=False, dataset_path=None, target_column=None, outer_folds=5, inner
     n_jobs = jobs or min(4, len(groups), os.cpu_count() or 1)
     outer = StratifiedKFold(outer_folds, shuffle=True, random_state=seed)
     outer_rows, all_search_rows, fold_details = [], [], []
+    # Tune and evaluate each candidate using only the current outer-training partition.
     for outer_i, (it, iv) in enumerate(outer.split(X, y), 1):
         print(f"Outer fold {outer_i}/{outer_folds}: inner tuning over {len(configs) * len(c_values)} settings", flush=True)
         Xtr, Xev, ytr, yev = X.iloc[it], X.iloc[iv], y[it], y[iv]
@@ -448,6 +471,7 @@ def run(quick=False, dataset_path=None, target_column=None, outer_folds=5, inner
               f"reps={best['reps']} {best['entanglement']} {best['kernel_type']}{proj_text} "
               f"C={best['C']} scale={best['scale']:.3g}", flush=True)
 
+    # Save fold metrics, candidate scores, and per-fold selection details.
     results = pd.DataFrame(outer_rows)
     results.to_csv(OUT / "nested_cv_fold_results.csv", index=False)
     pd.DataFrame(all_search_rows).to_csv(OUT / "nested_cv_search_results.csv", index=False)
@@ -483,6 +507,7 @@ def run(quick=False, dataset_path=None, target_column=None, outer_folds=5, inner
                 "scikit_learn": sklearn.__version__, "qiskit": qiskit.__version__,
                 "elapsed_seconds": round(time.perf_counter() - started, 3)}
     (OUT / "run_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    # Save preprocessing and classifier components for later research inference.
     try:
         import joblib
         joblib.dump({"encoder": fitted[0], "reducer": fitted[1], "minmax": fitted[2],
@@ -548,6 +573,7 @@ def run(quick=False, dataset_path=None, target_column=None, outer_folds=5, inner
     print(f"\nComplete in {metadata['elapsed_seconds']:.1f}s. Review: {OUT / 'review_report.md'}", flush=True)
 
 
+# Parse command-line options and start the requested experiment.
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--quick", action="store_true", help="Use a small search space for a quick pipeline run")
@@ -562,5 +588,6 @@ def main():
         args.inner_folds, args.jobs, args.seed)
 
 
+# Run the CLI only when this file is executed directly.
 if __name__ == "__main__":
     main()

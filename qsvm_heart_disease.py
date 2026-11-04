@@ -20,6 +20,7 @@ from qiskit.circuit.library import ZZFeatureMap
 from qiskit_machine_learning.kernels import FidelityQuantumKernel
 from qiskit_machine_learning.algorithms import QSVC
 
+# Run the original single-split QSVM and classical comparison workflow.
 def main():
     # ----------------------------- Config -----------------------------
     N_QUBITS = 4          # PCA components = qubits (keep small: simulation cost grows fast)
@@ -43,6 +44,7 @@ def main():
         target_col = y.columns[0]
         df[target_col] = (df[target_col] > 0).astype(int)  # 0 = no disease, 1 = disease
 
+    # Keep a reproducible, class-proportional subset when a sample limit is set.
     if MAX_SAMPLES and len(df) > MAX_SAMPLES:
         df = df.groupby(target_col, group_keys=False).apply(
             lambda g: g.sample(int(MAX_SAMPLES * len(g) / len(df)), random_state=SEED))
@@ -53,6 +55,7 @@ def main():
     print(f"Samples: {len(df)} | Features: {len(feature_names)} | "
           f"Class balance: {np.bincount(y)}")
 
+    # Reserve a stratified holdout set for the one-time baseline evaluation.
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=TEST_SIZE, stratify=y, random_state=SEED)
 
@@ -62,6 +65,7 @@ def main():
     minmax = MinMaxScaler(feature_range=(0, np.pi))
 
 
+    # Apply the training-fitted scaler, PCA projection, and angle scaling.
     def preprocess(data, fit=False):
         z = pca.transform(scaler.transform(data))
         return minmax.fit_transform(z) if fit else minmax.transform(z)
@@ -72,6 +76,7 @@ def main():
     print(f"PCA explained variance: {pca.explained_variance_ratio_.sum():.2%}")
 
     # ----------------------------- QSVM -------------------------------
+    # Configure and fit a fidelity-kernel QSVM on the transformed training rows.
     feature_map = ZZFeatureMap(feature_dimension=N_QUBITS, reps=REPS, entanglement="linear")
     qkernel = FidelityQuantumKernel(feature_map=feature_map)
     qsvc = QSVC(quantum_kernel=qkernel)
@@ -83,6 +88,7 @@ def main():
     y_score = qsvc.decision_function(Xq_test)
 
     # ----------------------------- Metrics ----------------------------
+    # Print thresholded metrics, score ranking, confusion matrix, and class report.
     def report(name, y_true, y_hat, y_sc):
         print(f"\n===== {name} =====")
         print(f"Accuracy : {accuracy_score(y_true, y_hat):.4f}")
@@ -102,6 +108,7 @@ def main():
            svc.decision_function(Xq_test))
 
     # ------------------------ Sample data testing ---------------------
+    # Show a few held-out predictions and one example custom input.
     LABELS = {0: "No disease", 1: "Disease"}
 
     print("\n===== Sample predictions from the test set =====")
@@ -114,6 +121,7 @@ def main():
 
     print("\n===== Custom patient prediction =====")
     # Order: age, sex, cp, trestbps, chol, fbs, restecg, thalach, exang, oldpeak, slope, ca, thal
+    # Build one example patient row in the dataset's expected feature order.
     new_patient = {
         "age": 58, "sex": 1, "cp": 4, "trestbps": 140, "chol": 260, "fbs": 0,
         "restecg": 2, "thalach": 120, "exang": 1, "oldpeak": 2.4, "slope": 2,
@@ -126,5 +134,6 @@ def main():
     print("Prediction:", LABELS[pred])
 
 
+# Run the baseline workflow only when invoked as a script.
 if __name__ == "__main__":
     main()

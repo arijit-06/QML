@@ -215,12 +215,14 @@ Where the QSVM demonstrated genuine clinical utility was in **decision boundary 
 
 ### 9.1 Installation
 ```bash
+# Install the libraries used by the project pipeline.
 pip install qiskit qiskit-machine-learning ucimlrepo scikit-learn pandas numpy matplotlib joblib
 ```
 
 ### 9.2 Running the Full Pipeline
 Executes the full 128-configuration parallel grid search, out-of-fold threshold tuning, classical baseline comparisons, 5-seed robustness checks, and figure generation:
 ```bash
+# Run the full nested-CV pipeline and its configured search.
 python qsvm_heart_disease_tuned.py
 ```
 *(Runtime: ~18–25 seconds across multi-core CPUs).*
@@ -228,11 +230,13 @@ python qsvm_heart_disease_tuned.py
 ### 9.3 Running Quick Mode (Smoke Test)
 Executes a minimal parameter grid in ~3 seconds for rapid code verification:
 ```bash
+# Run the pipeline's smaller quick-mode search.
 python qsvm_heart_disease_tuned.py --quick
 ```
 
 ### 9.4 Optional: Custom Dataset Path
 To evaluate on an external dataset (e.g., 918-patient merged CSV):
 ```bash
+# Run the pipeline on a supplied CSV dataset.
 python qsvm_heart_disease_tuned.py --dataset-path path/to/dataset.csv
 ```

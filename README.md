@@ -21,12 +21,14 @@ In the current full nested-CV run, an 8-qubit projected QSVM obtained mean outer
 Install the pinned environment from `requirements.txt`, then run from any working directory:
 
 ```powershell
+# Run the full nested-CV quantum and classical model search.
 python C:\PROGGING\qml\qsvm_heart_disease_tuned.py
 ```
 
 By default, this runs 5 outer × 5 inner folds and the full search. For a quick pipeline run:
 
 ```powershell
+# Run a smaller nested-CV search for a quicker pipeline run.
 python C:\PROGGING\qml\qsvm_heart_disease_tuned.py --quick --outer-folds 3 --inner-folds 3
 ```
 
@@ -47,16 +49,20 @@ Current nested-CV files in `outputs/` are overwritten on each run. Results from 
 The bundle can be used from Python:
 
 ```python
+# Load the saved model and its dataframe prediction helper.
 import joblib
 import pandas as pd
 from qsvm_heart_disease_tuned import predict_frame
 
+# Restore the fitted inference components from the review artifact.
 model = joblib.load(r"C:\PROGGING\qml\outputs\qsvm_review_model.joblib")
+# Create one patient row using the model's expected feature columns.
 patient = pd.DataFrame([{
     "age": 58, "sex": 1, "cp": 4, "trestbps": 140, "chol": 260,
     "fbs": 0, "restecg": 2, "thalach": 120, "exang": 1,
     "oldpeak": 2.4, "slope": 2, "ca": 2, "thal": 7,
 }])
+# Print the standardized score, selected threshold, and predicted class.
 print(predict_frame(model, patient))
 ```
 
